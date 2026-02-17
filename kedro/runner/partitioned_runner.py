@@ -1,27 +1,27 @@
-"""``PartitionedRunner`` and ``parallel_partitions`` provide parallel
-processing of PartitionedDataset partitions within Kedro pipelines.
+"""``PartitionedRunner`` provides parallel processing of PartitionedDataset
+partitions within Kedro pipelines.
 
 This module addresses a key limitation in Kedro: pipelines are static DAGs,
 so there is no way to dynamically create N parallel nodes for N partitions
 at runtime. Instead, a single node receives all partitions as a
 ``Dict[str, Callable]`` and must iterate them sequentially.
 
-This module provides two complementary approaches:
+``PartitionedRunner`` is a runner that automatically detects partitioned
+inputs (``Dict[str, Callable]``) and parallelizes partition loading and
+processing within each node using a thread pool.  Users write simple
+per-partition functions and the runner handles the fan-out / fan-in.
 
-1. ``parallel_partitions`` decorator: Transforms a per-partition function
-   into one that loads and processes all partitions concurrently. Works
-   with any runner.
-
-2. ``PartitionedRunner``: A runner that automatically detects partitioned
-   inputs (``Dict[str, Callable]``) and parallelizes partition loading
-   and processing within each node using a thread pool.
+A ``partitioned_pipeline`` helper is also provided to explicitly tag
+nodes that consume partitioned datasets, making the intent clear in the
+pipeline definition.
 """
 
 from __future__ import annotations
 
+import collections
+import itertools
 import logging
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from functools import wraps
 from typing import TYPE_CHECKING, Any, Callable
 
 from kedro.runner.runner import AbstractRunner
@@ -36,16 +36,17 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Tag applied to nodes whose inputs include partitioned datasets.
+PARTITIONED_TAG = "kedro.partitioned"
+
 
 def _is_partition_dict(data: Any) -> bool:
-    """Detect whether data matches the PartitionedDataset.load() signature.
+    """Detect whether *data* matches the ``PartitionedDataset.load()`` shape.
 
-    PartitionedDataset.load() returns ``Dict[str, Callable]`` where each
+    ``PartitionedDataset.load()`` returns ``Dict[str, Callable]`` where each
     value is a lazy-loading function for that partition.  We use a duck-typing
     check: a non-empty dict whose keys are all strings and values are all
     callable.
-
-    We require at least one entry to avoid false positives on empty dicts.
     """
     return (
         isinstance(data, dict)
@@ -55,146 +56,81 @@ def _is_partition_dict(data: Any) -> bool:
     )
 
 
+def _wrap_as_lazy_loaders(partition_dict: dict[str, Any]) -> dict[str, Callable]:
+    """Wrap a ``{key: value}`` dict into ``{key: lambda: value}``.
+
+    This makes the output of a partitioned node look like the load result of
+    a ``PartitionedDataset``, enabling downstream nodes (even through a
+    ``MemoryDataset`` intermediate) to chain partition-parallel processing.
+
+    ``PartitionedDataset.save()`` already handles both raw values **and**
+    callables, so this is safe for persistent outputs too.
+    """
+    return {key: (lambda v=val: v) for key, val in partition_dict.items()}
+
+
 # ---------------------------------------------------------------------------
-# parallel_partitions decorator
+# partitioned_pipeline helper
 # ---------------------------------------------------------------------------
 
 
-def parallel_partitions(
-    func: Callable | None = None,
-    *,
-    max_workers: int | None = None,
-) -> Callable:
-    """Decorator that parallelizes processing of PartitionedDataset partitions.
+def partitioned_pipeline(
+    pipe: Pipeline,
+    partitioned_datasets: set[str],
+) -> Pipeline:
+    """Return a copy of *pipe* where every node that consumes at least one
+    dataset in *partitioned_datasets* is tagged with :data:`PARTITIONED_TAG`.
 
-    Transforms a function that processes **a single partition's data** into
-    one that processes all partitions concurrently using a thread pool.
+    This makes the pipeline definition explicit about which nodes should
+    receive partition-parallel treatment from :class:`PartitionedRunner`,
+    without requiring any changes to the node functions themselves.
 
-    The decorated function should accept a single positional argument (the
-    loaded partition data) plus any additional arguments, and return the
-    processed result for that partition.
+    Example::
 
-    When the decorated function is called with a ``Dict[str, Callable]``
-    (the return value of ``PartitionedDataset.load()``), it will:
+        from kedro.pipeline import node, pipeline
+        from kedro.runner.partitioned_runner import (
+            PartitionedRunner,
+            partitioned_pipeline,
+        )
 
-    1. Load each partition concurrently via the thread pool.
-    2. Apply the original function to each loaded partition concurrently.
-    3. Return ``Dict[str, result]`` suitable for ``PartitionedDataset.save()``.
-
-    When called with regular (non-partitioned) data, the original function
-    is invoked normally with no parallelism.
-
-    Can be used with or without arguments::
-
-        @parallel_partitions
-        def process(data):
+        def clean(data):
             return data.dropna()
 
-        @parallel_partitions(max_workers=8)
-        def process(data):
-            return data.dropna()
+        def transform(data):
+            return data * 2
+
+        my_pipeline = partitioned_pipeline(
+            pipeline([
+                node(clean, "raw", "cleaned", name="clean"),
+                node(transform, "cleaned", "final", name="transform"),
+            ]),
+            partitioned_datasets={"raw", "cleaned", "final"},
+        )
+
+        PartitionedRunner(max_workers=4).run(my_pipeline, catalog)
 
     Args:
-        func: The function to decorate (supplied automatically when the
-            decorator is used without parentheses).
-        max_workers: Maximum number of threads for concurrent partition
-            processing.  Defaults to ``None`` (the ``ThreadPoolExecutor``
-            default, typically ``min(32, os.cpu_count() + 4)``).
+        pipe: The source pipeline.
+        partitioned_datasets: Names of datasets that carry partitioned data
+            (i.e. their loaded form is ``Dict[str, Callable]``).
 
     Returns:
-        A wrapper that transparently handles partitioned or regular inputs.
+        A new :class:`Pipeline` where the relevant nodes carry the
+        ``kedro.partitioned`` tag.
     """
+    from kedro.pipeline import pipeline as make_pipeline
 
-    def decorator(fn: Callable) -> Callable:
-        @wraps(fn)
-        def wrapper(*args: Any, **kwargs: Any) -> Any:
-            # Locate the partitioned argument (Dict[str, Callable]).
-            partition_arg_idx: int | None = None
-            partition_kwarg_key: str | None = None
-
-            for i, arg in enumerate(args):
-                if _is_partition_dict(arg):
-                    partition_arg_idx = i
-                    break
-
-            if partition_arg_idx is None:
-                for key, val in kwargs.items():
-                    if _is_partition_dict(val):
-                        partition_kwarg_key = key
-                        break
-
-            # No partitioned input found -- pass through.
-            if partition_arg_idx is None and partition_kwarg_key is None:
-                return fn(*args, **kwargs)
-
-            # Extract the partitions dict and remaining arguments.
-            if partition_arg_idx is not None:
-                partitions: dict[str, Callable] = args[partition_arg_idx]
-                other_args = (*args[:partition_arg_idx], *args[partition_arg_idx + 1 :])
-            else:
-                assert partition_kwarg_key is not None
-                partitions = kwargs.pop(partition_kwarg_key)
-                other_args = args
-
-            logger.info(
-                "parallel_partitions: processing %d partitions with max_workers=%s",
-                len(partitions),
-                max_workers,
-            )
-
-            results: dict[str, Any] = {}
-
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_key: dict[Future, str] = {}
-                for partition_key, load_fn in partitions.items():
-                    future = executor.submit(
-                        _load_and_process,
-                        fn,
-                        load_fn,
-                        other_args,
-                        kwargs,
-                        partition_arg_idx,
-                        partition_kwarg_key,
-                    )
-                    future_to_key[future] = partition_key
-
-                for future in as_completed(future_to_key):
-                    key = future_to_key[future]
-                    results[key] = future.result()  # propagates exceptions
-
-            return results
-
-        # Expose metadata so callers can introspect.
-        wrapper._parallel_partitions = True  # type: ignore[attr-defined]
-        wrapper._max_workers = max_workers  # type: ignore[attr-defined]
-        return wrapper
-
-    # Support both @parallel_partitions and @parallel_partitions(...)
-    if func is not None:
-        return decorator(func)
-    return decorator
-
-
-def _load_and_process(
-    fn: Callable,
-    load_fn: Callable,
-    other_args: tuple,
-    kwargs: dict[str, Any],
-    partition_arg_idx: int | None,
-    partition_kwarg_key: str | None,
-) -> Any:
-    """Load a single partition and apply the processing function."""
-    data = load_fn()
-    if partition_arg_idx is not None:
-        full_args = (*other_args[:partition_arg_idx], data, *other_args[partition_arg_idx:])
-        return fn(*full_args, **kwargs)
-    else:
-        assert partition_kwarg_key is not None
-        return fn(*other_args, **{**kwargs, partition_kwarg_key: data})
+    tagged_nodes = []
+    for n in pipe.nodes:
+        if set(n.inputs) & partitioned_datasets:
+            tagged_nodes.append(n.tag(PARTITIONED_TAG))
+        else:
+            tagged_nodes.append(n)
+    return make_pipeline(tagged_nodes)
 
 
 # ---------------------------------------------------------------------------
-# PartitionedRunner
+# _PartitionedTask
 # ---------------------------------------------------------------------------
 
 
@@ -207,7 +143,8 @@ class _PartitionedTask(Task):
 
     1. Load all partitions concurrently.
     2. Call the node function once per partition with the loaded data.
-    3. Collect the per-partition results into a ``Dict[str, result]``.
+    3. Collect the per-partition results into a ``Dict[str, Callable]``
+       (lazy loaders) so that downstream nodes can chain.
 
     For non-partitioned inputs the behaviour is identical to the base
     :class:`Task`.
@@ -222,6 +159,7 @@ class _PartitionedTask(Task):
         run_id: str | None = None,
         parallel: bool = False,
         partition_max_workers: int | None = None,
+        partitioned_datasets: set[str] | None = None,
     ):
         super().__init__(
             node=node,
@@ -232,6 +170,28 @@ class _PartitionedTask(Task):
             parallel=parallel,
         )
         self._partition_max_workers = partition_max_workers
+        self._partitioned_datasets = partitioned_datasets or set()
+
+    # -- helpers -----------------------------------------------------------
+
+    def _is_partitioned_input(self, name: str, data: Any) -> bool:
+        """Decide whether a loaded input should be treated as partitioned.
+
+        Uses explicit configuration (``partitioned_datasets``, node tag)
+        first, falling back to duck-typing when no explicit config is given.
+        """
+        # 1. Explicit runner-level configuration.
+        if name in self._partitioned_datasets:
+            return True
+        # 2. Pipeline-level tag applied by partitioned_pipeline().
+        if PARTITIONED_TAG in self.node.tags and _is_partition_dict(data):
+            return True
+        # 3. Fallback: duck-typing.
+        if not self._partitioned_datasets and PARTITIONED_TAG not in self.node.tags:
+            return _is_partition_dict(data)
+        return False
+
+    # -- overrides ---------------------------------------------------------
 
     def _run_node_sequential(
         self,
@@ -258,7 +218,9 @@ class _PartitionedTask(Task):
 
         # Detect partitioned inputs.
         partitioned_names = [
-            name for name, data in inputs.items() if _is_partition_dict(data)
+            name
+            for name, data in inputs.items()
+            if self._is_partitioned_input(name, data)
         ]
 
         if partitioned_names:
@@ -280,6 +242,8 @@ class _PartitionedTask(Task):
             )
         return node
 
+    # -- partition fan-out / fan-in ----------------------------------------
+
     def _run_node_over_partitions(  # noqa: PLR0913
         self,
         node: Node,
@@ -293,10 +257,14 @@ class _PartitionedTask(Task):
         """Run the node function once per partition, in parallel.
 
         If more than one input is partitioned, the partitions are aligned by
-        key (inner-join semantics — only keys present in ALL partitioned inputs
-        are processed).
+        key (inner-join semantics — only keys present in **all** partitioned
+        inputs are processed).
 
         Non-partitioned inputs are broadcast to every invocation unchanged.
+
+        Outputs are wrapped as lazy loaders (``Dict[str, Callable]``) so that
+        downstream nodes can chain partition-parallel processing even through
+        ``MemoryDataset`` intermediates.
         """
         # Collect partition keys (intersection of all partitioned inputs).
         partition_key_sets = [
@@ -322,7 +290,9 @@ class _PartitionedTask(Task):
 
         # Separate static (broadcast) inputs from partitioned ones.
         static_inputs = {
-            name: data for name, data in inputs.items() if name not in partitioned_names
+            name: data
+            for name, data in inputs.items()
+            if name not in partitioned_names
         }
         partitioned_inputs: dict[str, dict[str, Callable]] = {
             name: inputs[name] for name in partitioned_names
@@ -334,7 +304,6 @@ class _PartitionedTask(Task):
         with ThreadPoolExecutor(max_workers=self._partition_max_workers) as executor:
             future_to_key: dict[Future, str] = {}
             for pk in partition_keys:
-                # Build per-partition inputs: load partitioned data, merge static.
                 future = executor.submit(
                     self._process_single_partition,
                     node,
@@ -352,13 +321,17 @@ class _PartitionedTask(Task):
                 pk = future_to_key[future]
                 per_partition_results[pk] = future.result()
 
-        # Pivot: {partition_key: {output_name: value}} -> {output_name: {partition_key: value}}
+        # Pivot: {partition_key: {output_name: val}} -> {output_name: {pk: val}}
         merged_outputs: dict[str, dict[str, Any]] = {}
         for pk, outputs in per_partition_results.items():
             for output_name, value in outputs.items():
                 merged_outputs.setdefault(output_name, {})[pk] = value
 
-        return merged_outputs
+        # Wrap as lazy loaders so downstream nodes can chain.
+        return {
+            name: _wrap_as_lazy_loaders(partition_dict)
+            for name, partition_dict in merged_outputs.items()
+        }
 
     def _process_single_partition(  # noqa: PLR0913
         self,
@@ -393,6 +366,11 @@ class _PartitionedTask(Task):
         return outputs
 
 
+# ---------------------------------------------------------------------------
+# PartitionedRunner
+# ---------------------------------------------------------------------------
+
+
 class PartitionedRunner(AbstractRunner):
     """``PartitionedRunner`` executes pipeline nodes sequentially but
     processes partitions within each node **in parallel** using threads.
@@ -403,36 +381,59 @@ class PartitionedRunner(AbstractRunner):
 
     1. Loads each partition concurrently.
     2. Calls the node function once per partition.
-    3. Pivots the per-partition results into ``Dict[str, result]``
-       dictionaries keyed by partition ID, suitable for saving with
-       ``PartitionedDataset``.
+    3. Wraps per-partition results as lazy loaders so that downstream
+       nodes can chain partition-parallel processing — even through
+       ``MemoryDataset`` intermediates.
 
     For nodes that do not consume partitioned data, the behaviour is
     identical to :class:`SequentialRunner`.
 
-    This runner works around Kedro's static-pipeline limitation by
-    providing **data-level parallelism** within a single pipeline node,
-    without requiring dynamic node creation.
+    **Detection modes** (checked in order):
 
-    Example::
+    1. *Explicit* — dataset names passed via ``partitioned_datasets``.
+    2. *Pipeline tag* — nodes tagged ``kedro.partitioned`` by
+       :func:`partitioned_pipeline`.
+    3. *Duck-typing fallback* — when neither (1) nor (2) is configured,
+       the runner inspects each loaded input for the
+       ``Dict[str, Callable]`` shape.
+
+    Example — minimal::
 
         from kedro.runner import PartitionedRunner
 
         runner = PartitionedRunner(max_workers=8)
         runner.run(pipeline, catalog)
 
-    Or in ``settings.py``::
+    Example — explicit dataset names::
 
-        from kedro.runner import PartitionedRunner
+        runner = PartitionedRunner(
+            max_workers=4,
+            partitioned_datasets={"raw", "cleaned", "final"},
+        )
+        runner.run(pipeline, catalog)
 
-        SESSION_STORE_ARGS = {}
-        RUNNER = PartitionedRunner(max_workers=4)
+    Example — pipeline-level tagging::
+
+        from kedro.runner.partitioned_runner import (
+            PartitionedRunner,
+            partitioned_pipeline,
+        )
+
+        my_pipeline = partitioned_pipeline(
+            pipeline([
+                node(clean, "raw", "cleaned"),
+                node(transform, "cleaned", "final"),
+            ]),
+            partitioned_datasets={"raw", "cleaned", "final"},
+        )
+        PartitionedRunner(max_workers=4).run(my_pipeline, catalog)
     """
 
     def __init__(
         self,
         max_workers: int | None = None,
         is_async: bool = False,
+        partitioned_datasets: set[str] | None = None,
     ):
         """Instantiate the runner.
 
@@ -442,6 +443,11 @@ class PartitionedRunner(AbstractRunner):
                 ``ThreadPoolExecutor`` default).
             is_async: If True, the node inputs and outputs are loaded and
                 saved asynchronously with threads.  Defaults to False.
+            partitioned_datasets: Optional set of dataset names whose loaded
+                form is ``Dict[str, Callable]`` (i.e. from a
+                ``PartitionedDataset``).  When provided, only these inputs
+                trigger partition-parallel processing.  When *not* provided,
+                the runner falls back to duck-typing detection.
         """
         super().__init__(is_async=is_async)
         self._max_workers = (
@@ -449,6 +455,7 @@ class PartitionedRunner(AbstractRunner):
             if max_workers is not None
             else max_workers
         )
+        self._partitioned_datasets = partitioned_datasets or set()
 
     def _get_executor(self, max_workers: int) -> None:
         return None
@@ -468,8 +475,8 @@ class PartitionedRunner(AbstractRunner):
         self._validate_nodes(nodes)
         self._set_manager_datasets(catalog)
 
-        load_counts = __import__("collections").Counter(
-            __import__("itertools").chain.from_iterable(n.inputs for n in nodes)
+        load_counts = collections.Counter(
+            itertools.chain.from_iterable(n.inputs for n in nodes)
         )
         done_nodes: set[Node] = set()
 
@@ -481,22 +488,23 @@ class PartitionedRunner(AbstractRunner):
                 "#load-and-save-asynchronously"
             )
 
-        for node in nodes:
+        for exec_node in nodes:
             try:
                 _PartitionedTask(
-                    node=node,
+                    node=exec_node,
                     catalog=catalog,
                     hook_manager=hook_manager,
                     is_async=self._is_async,
                     run_id=run_id,
                     partition_max_workers=self._max_workers,
+                    partitioned_datasets=self._partitioned_datasets,
                 ).execute()
-                done_nodes.add(node)
+                done_nodes.add(exec_node)
             except Exception:
                 self._suggest_resume_scenario(pipeline, done_nodes, catalog)
                 raise
-            self._logger.info("Completed node: %s", node.name)
+            self._logger.info("Completed node: %s", exec_node.name)
             self._logger.info(
                 "Completed %d out of %d tasks", len(done_nodes), len(nodes)
             )
-            self._release_datasets(node, catalog, load_counts, pipeline)
+            self._release_datasets(exec_node, catalog, load_counts, pipeline)
