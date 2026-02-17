@@ -131,30 +131,32 @@ class TestPartitionedPipeline:
 
 
 # ---------------------------------------------------------------------------
-# PartitionedRunner — duck-typing detection (no explicit config)
+# PartitionedRunner — no implicit detection (explicit config required)
 # ---------------------------------------------------------------------------
 
 
-class TestPartitionedRunnerDuckTyping:
-    def test_basic_partitioned_pipeline(self):
-        """Auto-detect Dict[str, Callable] inputs and process in parallel."""
-        partitions = _make_partitions({"p1": 10, "p2": 20, "p3": 30})
+class TestPartitionedRunnerNoImplicitDetection:
+    def test_dict_of_callables_not_fanned_out_without_config(self):
+        """Without explicit config, Dict[str, Callable] inputs are passed
+        through as-is — no implicit duck-typing detection."""
+        partitions = _make_partitions({"p1": 10, "p2": 20})
         catalog = DataCatalog(
             datasets={
                 "raw": MemoryDataset(data=partitions),
-                "processed": MemoryDataset(),
+                "out": MemoryDataset(),
             }
         )
         test_pipeline = pipeline([
-            node(double, "raw", "processed", name="double_node"),
+            node(identity, "raw", "out", name="n1"),
         ])
 
-        PartitionedRunner(max_workers=2).run(test_pipeline, catalog)
+        PartitionedRunner().run(test_pipeline, catalog)
 
-        output = catalog.load("processed")
-        # Output is wrapped as lazy loaders for chaining.
-        assert _is_partition_dict(output)
-        assert {k: v() for k, v in output.items()} == {"p1": 20, "p2": 40, "p3": 60}
+        # Should be passed through unchanged — no fan-out.
+        out = catalog.load("out")
+        assert isinstance(out, dict)
+        assert set(out.keys()) == {"p1", "p2"}
+        assert all(callable(v) for v in out.values())
 
     def test_non_partitioned_pipeline(self):
         """Non-partitioned nodes should run normally."""
@@ -171,7 +173,50 @@ class TestPartitionedRunnerDuckTyping:
         PartitionedRunner().run(test_pipeline, catalog)
         assert catalog.load("output_data") == 84
 
+    def test_empty_dict_passthrough(self):
+        """Empty dict should pass through unchanged."""
+        catalog = DataCatalog(
+            datasets={
+                "input": MemoryDataset(data={}),
+                "output": MemoryDataset(),
+            }
+        )
+        test_pipeline = pipeline([
+            node(identity, "input", "output", name="id"),
+        ])
+
+        PartitionedRunner().run(test_pipeline, catalog)
+        assert catalog.load("output") == {}
+
+
+# ---------------------------------------------------------------------------
+# PartitionedRunner — partitioned_pipeline (recommended API)
+# ---------------------------------------------------------------------------
+
+
+class TestPartitionedPipelineAsAPI:
+    def test_basic_partitioned_pipeline(self):
+        """partitioned_pipeline tags nodes so the runner fans out."""
+        partitions = _make_partitions({"p1": 10, "p2": 20, "p3": 30})
+        catalog = DataCatalog(
+            datasets={
+                "raw": MemoryDataset(data=partitions),
+                "processed": MemoryDataset(),
+            }
+        )
+        pp = partitioned_pipeline(
+            pipeline([node(double, "raw", "processed", name="double_node")]),
+            partitioned_datasets={"raw"},
+        )
+
+        PartitionedRunner(max_workers=2).run(pp, catalog)
+
+        output = catalog.load("processed")
+        assert _is_partition_dict(output)
+        assert {k: v() for k, v in output.items()} == {"p1": 20, "p2": 40, "p3": 60}
+
     def test_mixed_partitioned_and_scalar_nodes(self):
+        """Only tagged nodes fan out; untagged nodes run normally."""
         partitions = _make_partitions({"a": 5, "b": 10})
         catalog = DataCatalog(
             datasets={
@@ -181,12 +226,15 @@ class TestPartitionedRunnerDuckTyping:
                 "part_out": MemoryDataset(),
             }
         )
-        test_pipeline = pipeline([
-            node(double, "scalar_in", "scalar_out", name="scalar"),
-            node(double, "part_in", "part_out", name="partitioned"),
-        ])
+        pp = partitioned_pipeline(
+            pipeline([
+                node(double, "scalar_in", "scalar_out", name="scalar"),
+                node(double, "part_in", "part_out", name="partitioned"),
+            ]),
+            partitioned_datasets={"part_in"},
+        )
 
-        PartitionedRunner().run(test_pipeline, catalog)
+        PartitionedRunner().run(pp, catalog)
 
         assert catalog.load("scalar_out") == 200
 
@@ -204,34 +252,73 @@ class TestPartitionedRunnerDuckTyping:
                 "result": MemoryDataset(),
             }
         )
-        test_pipeline = pipeline([
-            node(
-                add_offset,
-                inputs={"data": "raw", "params_offset": "offset"},
-                outputs="result",
-                name="add_offset",
-            ),
-        ])
+        pp = partitioned_pipeline(
+            pipeline([
+                node(
+                    add_offset,
+                    inputs={"data": "raw", "params_offset": "offset"},
+                    outputs="result",
+                    name="add_offset",
+                ),
+            ]),
+            partitioned_datasets={"raw"},
+        )
 
-        PartitionedRunner(max_workers=2).run(test_pipeline, catalog)
+        PartitionedRunner(max_workers=2).run(pp, catalog)
 
         result = catalog.load("result")
         assert {k: v() for k, v in result.items()} == {"a": 15, "b": 25}
 
-    def test_empty_dict_passthrough(self):
-        """Empty dict should NOT trigger partition detection."""
+    def test_compose_with_regular_pipeline(self):
+        """partitioned_pipeline result can be merged with regular pipelines."""
+        partitions = _make_partitions({"a": 5})
         catalog = DataCatalog(
             datasets={
-                "input": MemoryDataset(data={}),
-                "output": MemoryDataset(),
+                "raw": MemoryDataset(data=partitions),
+                "cleaned": MemoryDataset(),
+                "scalar_in": MemoryDataset(data=99),
+                "scalar_out": MemoryDataset(),
             }
         )
-        test_pipeline = pipeline([
-            node(identity, "input", "output", name="id"),
+        pp = partitioned_pipeline(
+            pipeline([node(double, "raw", "cleaned", name="clean")]),
+            partitioned_datasets={"raw"},
+        )
+        regular = pipeline([
+            node(double, "scalar_in", "scalar_out", name="scalar_op"),
         ])
+        full = pp + regular
 
-        PartitionedRunner().run(test_pipeline, catalog)
-        assert catalog.load("output") == {}
+        PartitionedRunner().run(full, catalog)
+
+        cleaned = catalog.load("cleaned")
+        assert _is_partition_dict(cleaned)
+        assert {k: v() for k, v in cleaned.items()} == {"a": 10}
+        assert catalog.load("scalar_out") == 198
+
+    def test_memory_dataset_intermediate_chaining(self):
+        """MemoryDataset intermediates declared as partitioned chain correctly."""
+        partitions = _make_partitions({"x": 3, "y": 7})
+        catalog = DataCatalog(
+            datasets={
+                "raw": MemoryDataset(data=partitions),
+                "intermediate": MemoryDataset(),
+                "final": MemoryDataset(),
+            }
+        )
+        pp = partitioned_pipeline(
+            pipeline([
+                node(double, "raw", "intermediate", name="first"),
+                node(double, "intermediate", "final", name="second"),
+            ]),
+            partitioned_datasets={"raw", "intermediate"},
+        )
+
+        PartitionedRunner(max_workers=2).run(pp, catalog)
+
+        final = catalog.load("final")
+        assert _is_partition_dict(final)
+        assert {k: v() for k, v in final.items()} == {"x": 12, "y": 28}
 
 
 # ---------------------------------------------------------------------------
@@ -242,8 +329,8 @@ class TestPartitionedRunnerDuckTyping:
 class TestPartitionedRunnerChaining:
     def test_two_node_chain_via_memory_dataset(self):
         """Partitioned outputs wrapped as lazy loaders should enable a second
-        node to auto-detect and process partitions in parallel — even when the
-        intermediate dataset is a plain MemoryDataset."""
+        node to process partitions in parallel — even when the intermediate
+        dataset is a plain MemoryDataset."""
         partitions = _make_partitions({"x": 3, "y": 7})
         catalog = DataCatalog(
             datasets={
@@ -252,12 +339,15 @@ class TestPartitionedRunnerChaining:
                 "final": MemoryDataset(),
             }
         )
-        test_pipeline = pipeline([
-            node(double, "raw", "intermediate", name="first"),
-            node(double, "intermediate", "final", name="second"),
-        ])
+        pp = partitioned_pipeline(
+            pipeline([
+                node(double, "raw", "intermediate", name="first"),
+                node(double, "intermediate", "final", name="second"),
+            ]),
+            partitioned_datasets={"raw", "intermediate"},
+        )
 
-        PartitionedRunner(max_workers=2).run(test_pipeline, catalog)
+        PartitionedRunner(max_workers=2).run(pp, catalog)
 
         final = catalog.load("final")
         assert _is_partition_dict(final)
@@ -273,13 +363,16 @@ class TestPartitionedRunnerChaining:
                 "d3": MemoryDataset(),
             }
         )
-        test_pipeline = pipeline([
-            node(double, "d0", "d1", name="n1"),
-            node(double, "d1", "d2", name="n2"),
-            node(double, "d2", "d3", name="n3"),
-        ])
+        pp = partitioned_pipeline(
+            pipeline([
+                node(double, "d0", "d1", name="n1"),
+                node(double, "d1", "d2", name="n2"),
+                node(double, "d2", "d3", name="n3"),
+            ]),
+            partitioned_datasets={"d0", "d1", "d2"},
+        )
 
-        PartitionedRunner().run(test_pipeline, catalog)
+        PartitionedRunner().run(pp, catalog)
 
         result = catalog.load("d3")
         # 1 -> 2 -> 4 -> 8
@@ -402,12 +495,13 @@ class TestPartitionedRunnerErrors:
                 "output": MemoryDataset(),
             }
         )
-        test_pipeline = pipeline([
-            node(fail_on_zero, "input", "output", name="failing"),
-        ])
+        pp = partitioned_pipeline(
+            pipeline([node(fail_on_zero, "input", "output", name="failing")]),
+            partitioned_datasets={"input"},
+        )
 
         with pytest.raises(ZeroDivisionError):
-            PartitionedRunner().run(test_pipeline, catalog)
+            PartitionedRunner().run(pp, catalog)
 
     def test_max_workers_zero_raises(self):
         with pytest.raises(ValueError, match="positive"):
@@ -432,12 +526,13 @@ class TestPartitionedRunnerLogging:
                 "output": MemoryDataset(),
             }
         )
-        test_pipeline = pipeline([
-            node(identity, "input", "output", name="test"),
-        ])
+        pp = partitioned_pipeline(
+            pipeline([node(identity, "input", "output", name="test")]),
+            partitioned_datasets={"input"},
+        )
 
         with caplog.at_level(logging.INFO):
-            PartitionedRunner(max_workers=2).run(test_pipeline, catalog)
+            PartitionedRunner(max_workers=2).run(pp, catalog)
 
         assert "processing 2 partitions" in caplog.text.lower()
 
@@ -464,11 +559,12 @@ class TestPartitionedRunnerConcurrency:
                 "output": MemoryDataset(),
             }
         )
-        test_pipeline = pipeline([
-            node(record_thread, "input", "output", name="concurrent"),
-        ])
+        pp = partitioned_pipeline(
+            pipeline([node(record_thread, "input", "output", name="concurrent")]),
+            partitioned_datasets={"input"},
+        )
 
-        PartitionedRunner(max_workers=4).run(test_pipeline, catalog)
+        PartitionedRunner(max_workers=4).run(pp, catalog)
         # At least one worker thread was used (they're different from main).
         assert len(seen_threads) >= 1
 
@@ -497,6 +593,7 @@ class TestPartitionedTask:
             is_async=False,
             hook_manager=_NullPluginManager(),
             partition_max_workers=2,
+            partitioned_datasets={"input"},
         )
         result_node = task.execute()
         assert result_node.name == "test"

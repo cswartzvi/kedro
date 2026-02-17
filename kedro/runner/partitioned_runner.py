@@ -6,14 +6,19 @@ so there is no way to dynamically create N parallel nodes for N partitions
 at runtime. Instead, a single node receives all partitions as a
 ``Dict[str, Callable]`` and must iterate them sequentially.
 
-``PartitionedRunner`` is a runner that automatically detects partitioned
-inputs (``Dict[str, Callable]``) and parallelizes partition loading and
+``PartitionedRunner`` is a runner that parallelizes partition loading and
 processing within each node using a thread pool.  Users write simple
 per-partition functions and the runner handles the fan-out / fan-in.
 
-A ``partitioned_pipeline`` helper is also provided to explicitly tag
-nodes that consume partitioned datasets, making the intent clear in the
-pipeline definition.
+The ``partitioned_pipeline`` helper explicitly tags nodes that consume
+partitioned datasets — this is the recommended way to declare which
+datasets carry partitioned data.  The resulting pipeline composes
+naturally with other pipelines via ``+``.
+
+Partitioned datasets can be backed by ``PartitionedDataset`` on disk
+**or** by ``MemoryDataset`` intermediates — any dataset name listed in
+``partitioned_datasets`` will be treated as carrying partition data
+(``Dict[str, Callable]``), regardless of the underlying storage.
 """
 
 from __future__ import annotations
@@ -177,8 +182,9 @@ class _PartitionedTask(Task):
     def _is_partitioned_input(self, name: str, data: Any) -> bool:
         """Decide whether a loaded input should be treated as partitioned.
 
-        Uses explicit configuration (``partitioned_datasets``, node tag)
-        first, falling back to duck-typing when no explicit config is given.
+        Uses explicit configuration only: either the dataset name was passed
+        to ``PartitionedRunner(partitioned_datasets=...)`` or the node was
+        tagged via :func:`partitioned_pipeline`.  No duck-typing fallback.
         """
         # 1. Explicit runner-level configuration.
         if name in self._partitioned_datasets:
@@ -186,9 +192,6 @@ class _PartitionedTask(Task):
         # 2. Pipeline-level tag applied by partitioned_pipeline().
         if PARTITIONED_TAG in self.node.tags and _is_partition_dict(data):
             return True
-        # 3. Fallback: duck-typing.
-        if not self._partitioned_datasets and PARTITIONED_TAG not in self.node.tags:
-            return _is_partition_dict(data)
         return False
 
     # -- overrides ---------------------------------------------------------
@@ -375,9 +378,7 @@ class PartitionedRunner(AbstractRunner):
     """``PartitionedRunner`` executes pipeline nodes sequentially but
     processes partitions within each node **in parallel** using threads.
 
-    When a node's input is detected as a ``Dict[str, Callable]`` (the
-    standard output of ``PartitionedDataset.load()``), the runner
-    automatically:
+    When a node's input is detected as partitioned, the runner:
 
     1. Loads each partition concurrently.
     2. Calls the node function once per partition.
@@ -388,31 +389,17 @@ class PartitionedRunner(AbstractRunner):
     For nodes that do not consume partitioned data, the behaviour is
     identical to :class:`SequentialRunner`.
 
-    **Detection modes** (checked in order):
+    **Detection requires explicit configuration** (checked in order):
 
-    1. *Explicit* — dataset names passed via ``partitioned_datasets``.
-    2. *Pipeline tag* — nodes tagged ``kedro.partitioned`` by
+    1. *Runner-level* — dataset names passed via ``partitioned_datasets``.
+    2. *Pipeline-level* — nodes tagged ``kedro.partitioned`` by
        :func:`partitioned_pipeline`.
-    3. *Duck-typing fallback* — when neither (1) nor (2) is configured,
-       the runner inspects each loaded input for the
-       ``Dict[str, Callable]`` shape.
 
-    Example — minimal::
+    The recommended approach is :func:`partitioned_pipeline`, which makes
+    the partitioned contract visible in the pipeline definition and
+    composes naturally with other pipelines via ``+``.
 
-        from kedro.runner import PartitionedRunner
-
-        runner = PartitionedRunner(max_workers=8)
-        runner.run(pipeline, catalog)
-
-    Example — explicit dataset names::
-
-        runner = PartitionedRunner(
-            max_workers=4,
-            partitioned_datasets={"raw", "cleaned", "final"},
-        )
-        runner.run(pipeline, catalog)
-
-    Example — pipeline-level tagging::
+    Example — pipeline-level tagging (recommended)::
 
         from kedro.runner.partitioned_runner import (
             PartitionedRunner,
@@ -426,7 +413,19 @@ class PartitionedRunner(AbstractRunner):
             ]),
             partitioned_datasets={"raw", "cleaned", "final"},
         )
-        PartitionedRunner(max_workers=4).run(my_pipeline, catalog)
+
+        # Compose with other pipelines normally.
+        full_pipeline = my_pipeline + reporting_pipeline
+
+        PartitionedRunner(max_workers=4).run(full_pipeline, catalog)
+
+    Example — runner-level dataset names::
+
+        runner = PartitionedRunner(
+            max_workers=4,
+            partitioned_datasets={"raw", "cleaned", "final"},
+        )
+        runner.run(pipeline, catalog)
     """
 
     def __init__(
@@ -445,9 +444,11 @@ class PartitionedRunner(AbstractRunner):
                 saved asynchronously with threads.  Defaults to False.
             partitioned_datasets: Optional set of dataset names whose loaded
                 form is ``Dict[str, Callable]`` (i.e. from a
-                ``PartitionedDataset``).  When provided, only these inputs
-                trigger partition-parallel processing.  When *not* provided,
-                the runner falls back to duck-typing detection.
+                ``PartitionedDataset`` or a ``MemoryDataset`` carrying
+                partition data).  When provided, only these inputs trigger
+                partition-parallel processing.  Alternatively, use
+                :func:`partitioned_pipeline` to declare partitioned datasets
+                at the pipeline level.
         """
         super().__init__(is_async=is_async)
         self._max_workers = (
