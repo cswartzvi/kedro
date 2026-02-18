@@ -621,3 +621,180 @@ class TestPartitionedTask:
         )
         task.execute()
         assert catalog.load("output") == 100
+
+
+# ---------------------------------------------------------------------------
+# Multiple partitioned inputs (inner-join key alignment)
+# ---------------------------------------------------------------------------
+
+
+def add_two(a, b):
+    return a + b
+
+
+def concat(left, right):
+    return f"{left}-{right}"
+
+
+class TestMultiplePartitionedInputs:
+    def test_inner_join_aligned_keys(self):
+        """When two inputs are partitioned, only common keys are processed."""
+        parts_a = _make_partitions({"x": 10, "y": 20, "z": 30})
+        parts_b = _make_partitions({"y": 100, "z": 200, "w": 300})
+        catalog = DataCatalog(
+            datasets={
+                "a": MemoryDataset(data=parts_a),
+                "b": MemoryDataset(data=parts_b),
+                "out": MemoryDataset(),
+            }
+        )
+        pp = partitioned(
+            pipeline([
+                node(
+                    add_two,
+                    inputs={"a": "a", "b": "b"},
+                    outputs="out",
+                    name="add",
+                ),
+            ]),
+            datasets={"a", "b"},
+        )
+
+        PartitionedRunner(max_workers=2).run(pp, catalog)
+
+        out = catalog.load("out")
+        assert _is_partition_dict(out)
+        resolved = {k: v() for k, v in out.items()}
+        # Only "y" and "z" are common keys.
+        assert resolved == {"y": 120, "z": 230}
+
+    def test_no_common_keys_returns_empty(self, caplog):
+        """Disjoint partition keys should produce no outputs and log a warning."""
+        parts_a = _make_partitions({"x": 1})
+        parts_b = _make_partitions({"y": 2})
+        catalog = DataCatalog(
+            datasets={
+                "a": MemoryDataset(data=parts_a),
+                "b": MemoryDataset(data=parts_b),
+                "out": MemoryDataset(),
+            }
+        )
+        pp = partitioned(
+            pipeline([
+                node(
+                    add_two,
+                    inputs={"a": "a", "b": "b"},
+                    outputs="out",
+                    name="add",
+                ),
+            ]),
+            datasets={"a", "b"},
+        )
+
+        with caplog.at_level(logging.WARNING):
+            PartitionedRunner().run(pp, catalog)
+
+        assert "no common partition keys" in caplog.text.lower()
+
+
+# ---------------------------------------------------------------------------
+# Multiple outputs from a partitioned node
+# ---------------------------------------------------------------------------
+
+
+def split(x):
+    return x, x * 10
+
+
+class TestMultipleOutputs:
+    def test_partitioned_node_with_multiple_outputs(self):
+        """A partitioned node that returns multiple outputs should produce
+        partition dicts for each output."""
+        partitions = _make_partitions({"a": 3, "b": 5})
+        catalog = DataCatalog(
+            datasets={
+                "input": MemoryDataset(data=partitions),
+                "out1": MemoryDataset(),
+                "out2": MemoryDataset(),
+            }
+        )
+        pp = partitioned(
+            pipeline([
+                node(split, "input", ["out1", "out2"], name="split"),
+            ]),
+            datasets={"input"},
+        )
+
+        PartitionedRunner(max_workers=2).run(pp, catalog)
+
+        out1 = catalog.load("out1")
+        out2 = catalog.load("out2")
+        assert _is_partition_dict(out1)
+        assert _is_partition_dict(out2)
+        assert {k: v() for k, v in out1.items()} == {"a": 3, "b": 5}
+        assert {k: v() for k, v in out2.items()} == {"a": 30, "b": 50}
+
+
+# ---------------------------------------------------------------------------
+# Kedro params convention
+# ---------------------------------------------------------------------------
+
+
+class TestPartitionedWithParams:
+    def test_params_broadcast_to_partitions(self):
+        """Kedro params: prefix inputs should be broadcast (not partitioned)."""
+        partitions = _make_partitions({"a": 10, "b": 20})
+        catalog = DataCatalog(
+            datasets={
+                "raw": MemoryDataset(data=partitions),
+                "params:offset": MemoryDataset(data=5),
+                "result": MemoryDataset(),
+            }
+        )
+        pp = partitioned(
+            pipeline([
+                node(
+                    add_offset,
+                    inputs={"data": "raw", "params_offset": "params:offset"},
+                    outputs="result",
+                    name="with_params",
+                ),
+            ]),
+            datasets={"raw"},
+        )
+
+        PartitionedRunner(max_workers=2).run(pp, catalog)
+
+        result = catalog.load("result")
+        assert {k: v() for k, v in result.items()} == {"a": 15, "b": 25}
+
+
+# ---------------------------------------------------------------------------
+# Namespaced pipelines
+# ---------------------------------------------------------------------------
+
+
+class TestPartitionedWithNamespace:
+    def test_partitioned_with_namespaced_pipeline(self):
+        """partitioned() should work with namespaced pipelines when dataset
+        names include the namespace prefix."""
+        partitions = _make_partitions({"a": 4, "b": 8})
+        catalog = DataCatalog(
+            datasets={
+                "ns.raw": MemoryDataset(data=partitions),
+                "ns.processed": MemoryDataset(),
+            }
+        )
+        pp = partitioned(
+            pipeline(
+                [node(double, "raw", "processed", name="double_node")],
+                namespace="ns",
+            ),
+            datasets={"ns.raw"},
+        )
+
+        PartitionedRunner(max_workers=2).run(pp, catalog)
+
+        out = catalog.load("ns.processed")
+        assert _is_partition_dict(out)
+        assert {k: v() for k, v in out.items()} == {"a": 8, "b": 16}
