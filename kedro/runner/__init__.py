@@ -3,7 +3,7 @@ to execute ``Pipeline`` instances.
 """
 
 from .parallel_runner import ParallelRunner
-from .partitioned_runner import PartitionedRunner, partitioned_pipeline
+from .partitioned_runner import PartitionedRunner, partitioned
 from .runner import AbstractRunner
 from .sequential_runner import SequentialRunner
 from .task import Task
@@ -16,5 +16,5 @@ __all__ = [
     "SequentialRunner",
     "Task",
     "ThreadRunner",
-    "partitioned_pipeline",
+    "partitioned",
 ]

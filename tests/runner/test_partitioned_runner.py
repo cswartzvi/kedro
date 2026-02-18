@@ -1,4 +1,4 @@
-"""Tests for ``PartitionedRunner`` and ``partitioned_pipeline``."""
+"""Tests for ``PartitionedRunner`` and ``partitioned``."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from kedro.runner.partitioned_runner import (
     _PartitionedTask,
     _is_partition_dict,
     _wrap_as_lazy_loaders,
-    partitioned_pipeline,
+    partitioned,
 )
 
 
@@ -91,7 +91,7 @@ class TestWrapAsLazyLoaders:
 
 
 # ---------------------------------------------------------------------------
-# partitioned_pipeline helper
+# partitioned helper
 # ---------------------------------------------------------------------------
 
 
@@ -102,7 +102,7 @@ class TestPartitionedPipeline:
             node(identity, "cleaned", "final", name="transform"),
             node(identity, "unrelated", "other", name="other"),
         ])
-        pp = partitioned_pipeline(pipe, partitioned_datasets={"raw", "cleaned"})
+        pp = partitioned(pipe, datasets={"raw", "cleaned"})
 
         nodes_by_name = {n.name: n for n in pp.nodes}
         # "clean" consumes "raw" → tagged
@@ -116,15 +116,15 @@ class TestPartitionedPipeline:
         pipe = pipeline([
             node(identity, "raw", "out", name="n1", tags="existing"),
         ])
-        pp = partitioned_pipeline(pipe, partitioned_datasets={"raw"})
+        pp = partitioned(pipe, datasets={"raw"})
 
         n = list(pp.nodes)[0]
         assert "existing" in n.tags
         assert PARTITIONED_TAG in n.tags
 
-    def test_empty_partitioned_datasets(self):
+    def test_empty_datasets(self):
         pipe = pipeline([node(identity, "a", "b", name="n1")])
-        pp = partitioned_pipeline(pipe, partitioned_datasets=set())
+        pp = partitioned(pipe, datasets=set())
 
         n = list(pp.nodes)[0]
         assert PARTITIONED_TAG not in n.tags
@@ -190,13 +190,13 @@ class TestPartitionedRunnerNoImplicitDetection:
 
 
 # ---------------------------------------------------------------------------
-# PartitionedRunner — partitioned_pipeline (recommended API)
+# PartitionedRunner — partitioned (recommended API)
 # ---------------------------------------------------------------------------
 
 
 class TestPartitionedPipelineAsAPI:
-    def test_basic_partitioned_pipeline(self):
-        """partitioned_pipeline tags nodes so the runner fans out."""
+    def test_basic_partitioned(self):
+        """partitioned tags nodes so the runner fans out."""
         partitions = _make_partitions({"p1": 10, "p2": 20, "p3": 30})
         catalog = DataCatalog(
             datasets={
@@ -204,9 +204,9 @@ class TestPartitionedPipelineAsAPI:
                 "processed": MemoryDataset(),
             }
         )
-        pp = partitioned_pipeline(
+        pp = partitioned(
             pipeline([node(double, "raw", "processed", name="double_node")]),
-            partitioned_datasets={"raw"},
+            datasets={"raw"},
         )
 
         PartitionedRunner(max_workers=2).run(pp, catalog)
@@ -226,12 +226,12 @@ class TestPartitionedPipelineAsAPI:
                 "part_out": MemoryDataset(),
             }
         )
-        pp = partitioned_pipeline(
+        pp = partitioned(
             pipeline([
                 node(double, "scalar_in", "scalar_out", name="scalar"),
                 node(double, "part_in", "part_out", name="partitioned"),
             ]),
-            partitioned_datasets={"part_in"},
+            datasets={"part_in"},
         )
 
         PartitionedRunner().run(pp, catalog)
@@ -252,7 +252,7 @@ class TestPartitionedPipelineAsAPI:
                 "result": MemoryDataset(),
             }
         )
-        pp = partitioned_pipeline(
+        pp = partitioned(
             pipeline([
                 node(
                     add_offset,
@@ -261,7 +261,7 @@ class TestPartitionedPipelineAsAPI:
                     name="add_offset",
                 ),
             ]),
-            partitioned_datasets={"raw"},
+            datasets={"raw"},
         )
 
         PartitionedRunner(max_workers=2).run(pp, catalog)
@@ -270,7 +270,7 @@ class TestPartitionedPipelineAsAPI:
         assert {k: v() for k, v in result.items()} == {"a": 15, "b": 25}
 
     def test_compose_with_regular_pipeline(self):
-        """partitioned_pipeline result can be merged with regular pipelines."""
+        """partitioned result can be merged with regular pipelines."""
         partitions = _make_partitions({"a": 5})
         catalog = DataCatalog(
             datasets={
@@ -280,9 +280,9 @@ class TestPartitionedPipelineAsAPI:
                 "scalar_out": MemoryDataset(),
             }
         )
-        pp = partitioned_pipeline(
+        pp = partitioned(
             pipeline([node(double, "raw", "cleaned", name="clean")]),
-            partitioned_datasets={"raw"},
+            datasets={"raw"},
         )
         regular = pipeline([
             node(double, "scalar_in", "scalar_out", name="scalar_op"),
@@ -306,12 +306,12 @@ class TestPartitionedPipelineAsAPI:
                 "final": MemoryDataset(),
             }
         )
-        pp = partitioned_pipeline(
+        pp = partitioned(
             pipeline([
                 node(double, "raw", "intermediate", name="first"),
                 node(double, "intermediate", "final", name="second"),
             ]),
-            partitioned_datasets={"raw", "intermediate"},
+            datasets={"raw", "intermediate"},
         )
 
         PartitionedRunner(max_workers=2).run(pp, catalog)
@@ -339,12 +339,12 @@ class TestPartitionedRunnerChaining:
                 "final": MemoryDataset(),
             }
         )
-        pp = partitioned_pipeline(
+        pp = partitioned(
             pipeline([
                 node(double, "raw", "intermediate", name="first"),
                 node(double, "intermediate", "final", name="second"),
             ]),
-            partitioned_datasets={"raw", "intermediate"},
+            datasets={"raw", "intermediate"},
         )
 
         PartitionedRunner(max_workers=2).run(pp, catalog)
@@ -363,13 +363,13 @@ class TestPartitionedRunnerChaining:
                 "d3": MemoryDataset(),
             }
         )
-        pp = partitioned_pipeline(
+        pp = partitioned(
             pipeline([
                 node(double, "d0", "d1", name="n1"),
                 node(double, "d1", "d2", name="n2"),
                 node(double, "d2", "d3", name="n3"),
             ]),
-            partitioned_datasets={"d0", "d1", "d2"},
+            datasets={"d0", "d1", "d2"},
         )
 
         PartitionedRunner().run(pp, catalog)
@@ -432,7 +432,7 @@ class TestPartitionedRunnerExplicitConfig:
 
 
 # ---------------------------------------------------------------------------
-# PartitionedRunner — partitioned_pipeline tag
+# PartitionedRunner — partitioned tag
 # ---------------------------------------------------------------------------
 
 
@@ -445,9 +445,9 @@ class TestPartitionedRunnerWithTaggedPipeline:
                 "out": MemoryDataset(),
             }
         )
-        pp = partitioned_pipeline(
+        pp = partitioned(
             pipeline([node(double, "raw", "out", name="n1")]),
-            partitioned_datasets={"raw"},
+            datasets={"raw"},
         )
 
         PartitionedRunner().run(pp, catalog)
@@ -464,12 +464,12 @@ class TestPartitionedRunnerWithTaggedPipeline:
                 "final": MemoryDataset(),
             }
         )
-        pp = partitioned_pipeline(
+        pp = partitioned(
             pipeline([
                 node(double, "raw", "mid", name="n1"),
                 node(double, "mid", "final", name="n2"),
             ]),
-            partitioned_datasets={"raw", "mid"},
+            datasets={"raw", "mid"},
         )
 
         PartitionedRunner().run(pp, catalog)
@@ -495,9 +495,9 @@ class TestPartitionedRunnerErrors:
                 "output": MemoryDataset(),
             }
         )
-        pp = partitioned_pipeline(
+        pp = partitioned(
             pipeline([node(fail_on_zero, "input", "output", name="failing")]),
-            partitioned_datasets={"input"},
+            datasets={"input"},
         )
 
         with pytest.raises(ZeroDivisionError):
@@ -526,9 +526,9 @@ class TestPartitionedRunnerLogging:
                 "output": MemoryDataset(),
             }
         )
-        pp = partitioned_pipeline(
+        pp = partitioned(
             pipeline([node(identity, "input", "output", name="test")]),
-            partitioned_datasets={"input"},
+            datasets={"input"},
         )
 
         with caplog.at_level(logging.INFO):
@@ -559,9 +559,9 @@ class TestPartitionedRunnerConcurrency:
                 "output": MemoryDataset(),
             }
         )
-        pp = partitioned_pipeline(
+        pp = partitioned(
             pipeline([node(record_thread, "input", "output", name="concurrent")]),
-            partitioned_datasets={"input"},
+            datasets={"input"},
         )
 
         PartitionedRunner(max_workers=4).run(pp, catalog)

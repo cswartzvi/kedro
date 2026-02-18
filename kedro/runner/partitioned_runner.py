@@ -10,7 +10,7 @@ at runtime. Instead, a single node receives all partitions as a
 processing within each node using a thread pool.  Users write simple
 per-partition functions and the runner handles the fan-out / fan-in.
 
-The ``partitioned_pipeline`` helper explicitly tags nodes that consume
+The ``partitioned`` helper explicitly tags nodes that consume
 partitioned datasets — this is the recommended way to declare which
 datasets carry partitioned data.  The resulting pipeline composes
 naturally with other pipelines via ``+``.
@@ -75,16 +75,16 @@ def _wrap_as_lazy_loaders(partition_dict: dict[str, Any]) -> dict[str, Callable]
 
 
 # ---------------------------------------------------------------------------
-# partitioned_pipeline helper
+# partitioned helper
 # ---------------------------------------------------------------------------
 
 
-def partitioned_pipeline(
+def partitioned(
     pipe: Pipeline,
-    partitioned_datasets: set[str],
+    datasets: set[str],
 ) -> Pipeline:
     """Return a copy of *pipe* where every node that consumes at least one
-    dataset in *partitioned_datasets* is tagged with :data:`PARTITIONED_TAG`.
+    dataset in *datasets* is tagged with :data:`PARTITIONED_TAG`.
 
     This makes the pipeline definition explicit about which nodes should
     receive partition-parallel treatment from :class:`PartitionedRunner`,
@@ -95,7 +95,7 @@ def partitioned_pipeline(
         from kedro.pipeline import node, pipeline
         from kedro.runner.partitioned_runner import (
             PartitionedRunner,
-            partitioned_pipeline,
+            partitioned,
         )
 
         def clean(data):
@@ -104,19 +104,19 @@ def partitioned_pipeline(
         def transform(data):
             return data * 2
 
-        my_pipeline = partitioned_pipeline(
+        my_pipeline = partitioned(
             pipeline([
                 node(clean, "raw", "cleaned", name="clean"),
                 node(transform, "cleaned", "final", name="transform"),
             ]),
-            partitioned_datasets={"raw", "cleaned", "final"},
+            datasets={"raw", "cleaned", "final"},
         )
 
         PartitionedRunner(max_workers=4).run(my_pipeline, catalog)
 
     Args:
         pipe: The source pipeline.
-        partitioned_datasets: Names of datasets that carry partitioned data
+        datasets: Names of datasets that carry partitioned data
             (i.e. their loaded form is ``Dict[str, Callable]``).
 
     Returns:
@@ -127,7 +127,7 @@ def partitioned_pipeline(
 
     tagged_nodes = []
     for n in pipe.nodes:
-        if set(n.inputs) & partitioned_datasets:
+        if set(n.inputs) & datasets:
             tagged_nodes.append(n.tag(PARTITIONED_TAG))
         else:
             tagged_nodes.append(n)
@@ -184,12 +184,12 @@ class _PartitionedTask(Task):
 
         Uses explicit configuration only: either the dataset name was passed
         to ``PartitionedRunner(partitioned_datasets=...)`` or the node was
-        tagged via :func:`partitioned_pipeline`.  No duck-typing fallback.
+        tagged via :func:`partitioned`.  No duck-typing fallback.
         """
         # 1. Explicit runner-level configuration.
         if name in self._partitioned_datasets:
             return True
-        # 2. Pipeline-level tag applied by partitioned_pipeline().
+        # 2. Pipeline-level tag applied by partitioned().
         if PARTITIONED_TAG in self.node.tags and _is_partition_dict(data):
             return True
         return False
@@ -393,9 +393,9 @@ class PartitionedRunner(AbstractRunner):
 
     1. *Runner-level* — dataset names passed via ``partitioned_datasets``.
     2. *Pipeline-level* — nodes tagged ``kedro.partitioned`` by
-       :func:`partitioned_pipeline`.
+       :func:`partitioned`.
 
-    The recommended approach is :func:`partitioned_pipeline`, which makes
+    The recommended approach is :func:`partitioned`, which makes
     the partitioned contract visible in the pipeline definition and
     composes naturally with other pipelines via ``+``.
 
@@ -403,15 +403,15 @@ class PartitionedRunner(AbstractRunner):
 
         from kedro.runner.partitioned_runner import (
             PartitionedRunner,
-            partitioned_pipeline,
+            partitioned,
         )
 
-        my_pipeline = partitioned_pipeline(
+        my_pipeline = partitioned(
             pipeline([
                 node(clean, "raw", "cleaned"),
                 node(transform, "cleaned", "final"),
             ]),
-            partitioned_datasets={"raw", "cleaned", "final"},
+            datasets={"raw", "cleaned", "final"},
         )
 
         # Compose with other pipelines normally.
@@ -447,7 +447,7 @@ class PartitionedRunner(AbstractRunner):
                 ``PartitionedDataset`` or a ``MemoryDataset`` carrying
                 partition data).  When provided, only these inputs trigger
                 partition-parallel processing.  Alternatively, use
-                :func:`partitioned_pipeline` to declare partitioned datasets
+                :func:`partitioned` to declare partitioned datasets
                 at the pipeline level.
         """
         super().__init__(is_async=is_async)
