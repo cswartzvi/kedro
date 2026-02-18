@@ -7,8 +7,9 @@ at runtime. Instead, a single node receives all partitions as a
 ``Dict[str, Callable]`` and must iterate them sequentially.
 
 ``PartitionedRunner`` is a runner that parallelizes partition loading and
-processing within each node using a thread pool.  Users write simple
-per-partition functions and the runner handles the fan-out / fan-in.
+processing within each node using a thread pool or process pool.  Users
+write simple per-partition functions and the runner handles the fan-out /
+fan-in.
 
 The ``partitioned`` helper explicitly tags nodes that consume
 partitioned datasets — this is the recommended way to declare which
@@ -19,6 +20,14 @@ Partitioned datasets can be backed by ``PartitionedDataset`` on disk
 **or** by ``MemoryDataset`` intermediates — any dataset name listed in
 ``partitioned_datasets`` will be treated as carrying partition data
 (``Dict[str, Callable]``), regardless of the underlying storage.
+
+The ``backend`` parameter controls how partitions are parallelized:
+
+- ``"thread"`` (default): Uses ``ThreadPoolExecutor``.  No serialization
+  overhead, shares memory, suitable for I/O-bound or GIL-releasing work.
+- ``"process"``: Uses ``ProcessPoolExecutor`` with ``cloudpickle`` for
+  serialization.  Achieves true CPU parallelism by bypassing the GIL,
+  suitable for CPU-bound partition processing.  Requires ``cloudpickle``.
 """
 
 from __future__ import annotations
@@ -26,7 +35,7 @@ from __future__ import annotations
 import collections
 import itertools
 import logging
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING, Any, Callable
 
 from kedro.runner.runner import AbstractRunner
@@ -72,6 +81,77 @@ def _wrap_as_lazy_loaders(partition_dict: dict[str, Any]) -> dict[str, Callable]
     callables, so this is safe for persistent outputs too.
     """
     return {key: (lambda v=val: v) for key, val in partition_dict.items()}
+
+
+_VALID_BACKENDS = frozenset({"thread", "process"})
+
+
+def _validate_backend(backend: str) -> str:
+    """Validate and return the backend string."""
+    if backend not in _VALID_BACKENDS:
+        raise ValueError(
+            f"Invalid backend {backend!r}. Must be one of {sorted(_VALID_BACKENDS)}."
+        )
+    return backend
+
+
+def _import_cloudpickle():
+    """Lazy-import cloudpickle with a helpful error message."""
+    try:
+        import cloudpickle
+    except ImportError as exc:
+        raise ImportError(
+            "The 'process' backend requires cloudpickle. "
+            "Install it with: pip install cloudpickle"
+        ) from exc
+    return cloudpickle
+
+
+def _cloudpickle_call(payload: bytes) -> Any:
+    """Subprocess entry point: deserialize and execute a cloudpickle payload.
+
+    ``ProcessPoolExecutor`` uses standard pickle to send this function and
+    its ``bytes`` argument to the worker — both are always picklable.  The
+    actual task (which may contain lambdas/closures) is serialized inside
+    *payload* via ``cloudpickle``.
+    """
+    import cloudpickle
+
+    fn, args = cloudpickle.loads(payload)
+    return fn(*args)
+
+
+def _process_partition_standalone(
+    node: Node,
+    partition_key: str,
+    partitioned_inputs: dict[str, dict[str, Callable]],
+    static_inputs: dict[str, Any],
+) -> dict[str, Any]:
+    """Process a single partition — standalone version for multiprocessing.
+
+    Unlike ``_PartitionedTask._process_single_partition``, this does not
+    require a catalog or hook_manager (neither is serializable), making it
+    safe to send across process boundaries via cloudpickle.
+    """
+    partition_inputs = dict(static_inputs)
+    for name, partitions_dict in partitioned_inputs.items():
+        load_fn = partitions_dict[partition_key]
+        partition_inputs[name] = load_fn()
+    return node.run(partition_inputs)
+
+
+def _cloudpickle_submit(executor, fn, *args):
+    """Submit *fn(*args)* to a ``ProcessPoolExecutor`` via cloudpickle.
+
+    Standard pickle cannot handle lambdas, closures, or locally-defined
+    functions.  This helper serializes the task with ``cloudpickle`` and
+    submits a thin wrapper (``_cloudpickle_call``) that the executor
+    can pickle normally.
+    """
+    import cloudpickle
+
+    payload = cloudpickle.dumps((fn, args))
+    return executor.submit(_cloudpickle_call, payload)
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +221,7 @@ def partitioned(
 
 class _PartitionedTask(Task):
     """A :class:`Task` subclass that detects partitioned inputs and processes
-    them in parallel using a thread pool.
+    them in parallel using a thread pool or process pool.
 
     When a node input is a ``Dict[str, Callable]`` (the signature of
     ``PartitionedDataset.load()``), the task will:
@@ -165,6 +245,7 @@ class _PartitionedTask(Task):
         parallel: bool = False,
         partition_max_workers: int | None = None,
         partitioned_datasets: set[str] | None = None,
+        partition_backend: str = "thread",
     ):
         super().__init__(
             node=node,
@@ -176,6 +257,7 @@ class _PartitionedTask(Task):
         )
         self._partition_max_workers = partition_max_workers
         self._partitioned_datasets = partitioned_datasets or set()
+        self._partition_backend = partition_backend
 
     # -- helpers -----------------------------------------------------------
 
@@ -303,26 +385,53 @@ class _PartitionedTask(Task):
 
         # Process partitions concurrently.
         per_partition_results: dict[str, dict[str, Any]] = {}
+        use_processes = self._partition_backend == "process"
 
-        with ThreadPoolExecutor(max_workers=self._partition_max_workers) as executor:
+        executor_cls = ProcessPoolExecutor if use_processes else ThreadPoolExecutor
+
+        with executor_cls(max_workers=self._partition_max_workers) as executor:
             future_to_key: dict[Future, str] = {}
             for pk in partition_keys:
-                future = executor.submit(
-                    self._process_single_partition,
-                    node,
-                    catalog,
-                    pk,
-                    partitioned_inputs,
-                    static_inputs,
-                    is_async,
-                    hook_manager,
-                    run_id,
-                )
+                if use_processes:
+                    future = _cloudpickle_submit(
+                        executor,
+                        _process_partition_standalone,
+                        node,
+                        pk,
+                        partitioned_inputs,
+                        static_inputs,
+                    )
+                else:
+                    future = executor.submit(
+                        self._process_single_partition,
+                        node,
+                        catalog,
+                        pk,
+                        partitioned_inputs,
+                        static_inputs,
+                        is_async,
+                        hook_manager,
+                        run_id,
+                    )
                 future_to_key[future] = pk
 
             for future in as_completed(future_to_key):
                 pk = future_to_key[future]
-                per_partition_results[pk] = future.result()
+                try:
+                    per_partition_results[pk] = future.result()
+                except Exception as exc:
+                    if use_processes:
+                        # In the process backend, hooks can't fire in the
+                        # subprocess — fire them here in the main process.
+                        hook_manager.hook.on_node_error(
+                            error=exc,
+                            node=node,
+                            catalog=catalog,
+                            inputs={},
+                            is_async=is_async,
+                            run_id=run_id,
+                        )
+                    raise
 
         # Pivot: {partition_key: {output_name: val}} -> {output_name: {pk: val}}
         merged_outputs: dict[str, dict[str, Any]] = {}
@@ -376,7 +485,8 @@ class _PartitionedTask(Task):
 
 class PartitionedRunner(AbstractRunner):
     """``PartitionedRunner`` executes pipeline nodes sequentially but
-    processes partitions within each node **in parallel** using threads.
+    processes partitions within each node **in parallel** using threads
+    or processes.
 
     When a node's input is detected as partitioned, the runner:
 
@@ -419,6 +529,15 @@ class PartitionedRunner(AbstractRunner):
 
         PartitionedRunner(max_workers=4).run(full_pipeline, catalog)
 
+    Example — multiprocessing backend for CPU-bound work::
+
+        runner = PartitionedRunner(
+            max_workers=4,
+            backend="process",
+            partitioned_datasets={"raw", "cleaned", "final"},
+        )
+        runner.run(pipeline, catalog)
+
     Example — runner-level dataset names::
 
         runner = PartitionedRunner(
@@ -433,13 +552,14 @@ class PartitionedRunner(AbstractRunner):
         max_workers: int | None = None,
         is_async: bool = False,
         partitioned_datasets: set[str] | None = None,
+        backend: str = "thread",
     ):
         """Instantiate the runner.
 
         Args:
-            max_workers: Maximum number of threads for concurrent partition
+            max_workers: Maximum number of workers for concurrent partition
                 processing within each node.  Defaults to ``None`` (the
-                ``ThreadPoolExecutor`` default).
+                executor default — typically the number of CPUs).
             is_async: If True, the node inputs and outputs are loaded and
                 saved asynchronously with threads.  Defaults to False.
             partitioned_datasets: Optional set of dataset names whose loaded
@@ -449,6 +569,13 @@ class PartitionedRunner(AbstractRunner):
                 partition-parallel processing.  Alternatively, use
                 :func:`partitioned` to declare partitioned datasets
                 at the pipeline level.
+            backend: Parallelization strategy for partition processing.
+                ``"thread"`` (default) uses ``ThreadPoolExecutor`` — no
+                serialization overhead, shares memory, ideal for I/O-bound
+                or GIL-releasing work.  ``"process"`` uses
+                ``ProcessPoolExecutor`` with ``cloudpickle`` — achieves
+                true CPU parallelism by bypassing the GIL.  Requires
+                ``cloudpickle`` (``pip install cloudpickle``).
         """
         super().__init__(is_async=is_async)
         self._max_workers = (
@@ -457,6 +584,9 @@ class PartitionedRunner(AbstractRunner):
             else max_workers
         )
         self._partitioned_datasets = partitioned_datasets or set()
+        self._backend = _validate_backend(backend)
+        if self._backend == "process":
+            _import_cloudpickle()  # fail fast
 
     def _get_executor(self, max_workers: int) -> None:
         return None
@@ -499,6 +629,7 @@ class PartitionedRunner(AbstractRunner):
                     run_id=run_id,
                     partition_max_workers=self._max_workers,
                     partitioned_datasets=self._partitioned_datasets,
+                    partition_backend=self._backend,
                 ).execute()
                 done_nodes.add(exec_node)
             except Exception:
